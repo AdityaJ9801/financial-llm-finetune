@@ -94,55 +94,38 @@ model = FastLanguageModel.get_peft_model(
 # ==========================================
 # 4. DATASET UTILITIES
 # ==========================================
-# Load dataset using custom SFT split
 dataset = load_dataset("TheFinAI/FinCoT", split="SFT")
 
-print(f"Dataset columns detected: {dataset.column_names}")
-
 def format_fin_cot(examples):
-    # Dynamic resolution for column names
-    prompt_keys = ["instruction", "prompt", "question", "problem", "input"]
-    target_prompt_key = next((k for k in prompt_keys if k in examples), None)
-
-    response_keys = ["output", "response", "solution", "cot", "answer", "reasoning"]
-    target_response_key = next((k for k in response_keys if k in examples), None)
-
-    if not target_prompt_key or not target_response_key:
-        raise KeyError(
-            f"Could not map dataset columns. Available keys: {list(examples.keys())}"
-        )
-
-    prompts = examples[target_prompt_key]
-    responses = examples[target_response_key]
-    has_input = "input" in examples and target_prompt_key != "input"
-
     texts = []
-    for i in range(len(prompts)):
-        q = prompts[i] or ""
-        r = responses[i] or ""
+    questions = examples["Question"]
+    reasoning_traces = examples["Reasoning_process"]
+    final_answers = examples["Final_response"]
 
-        if has_input and examples["input"][i]:
-            extra_ctx = examples["input"][i]
-            user_content = f"{q}\n\nContext:\n{extra_ctx}" if extra_ctx != q else q
-        else:
-            user_content = q
+    for q, r, f in zip(questions, reasoning_traces, final_answers):
+        # Format the Assistant's full Chain-of-Thought output
+        assistant_content = f"{r}\n\n{f}"
 
         messages = [
-            {
-                "role": "user",
-                "content": f"Solve the following financial problem with step-by-step reasoning:\n{user_content}",
-            },
-            {"role": "assistant", "content": r},
+            {"role": "user", "content": q},
+            {"role": "assistant", "content": assistant_content},
         ]
+        
         text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
         )
         texts.append(text)
 
     return {"text": texts}
 
-
-dataset = dataset.map(format_fin_cot, batched=True)
+# Apply formatting and drop unneeded columns to save RAM/VRAM
+dataset = dataset.map(
+    format_fin_cot,
+    batched=True,
+    remove_columns=dataset.column_names,
+)
 
 # ==========================================
 # 5. SFT TRAINER WITH PROGRESS RETENTION
