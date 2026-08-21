@@ -13,9 +13,6 @@ from trl import SFTTrainer
 # ==========================================
 # 0.5 B200 / MIG PREFLIGHT CHECK
 # ==========================================
-# Your GPU is a B200 running under a MIG partition (per your nvidia-smi output),
-# so torch only sees the MIG slice's memory, not the full card. This check makes
-# that visible up front instead of failing with an opaque OOM mid-training.
 def preflight_check():
     assert torch.cuda.is_available(), "No CUDA device visible to torch."
     cap = torch.cuda.get_device_capability(0)
@@ -60,7 +57,7 @@ run = wandb.init(
 # 2. CONFIGURATION & B200 CUDA 12.8 RUNTIME ADAPTATIONS
 # ==========================================
 max_seq_length = 4096
-dtype = torch.bfloat16  # Native BF16 on Blackwell (sm_100) — no change needed here
+dtype = torch.bfloat16
 load_in_4bit = True
 
 model, tokenizer = FastLanguageModel.from_pretrained(
@@ -97,43 +94,61 @@ model = FastLanguageModel.get_peft_model(
 # ==========================================
 # 4. DATASET UTILITIES
 # ==========================================
+# Load dataset using custom SFT split
 dataset = load_dataset("TheFinAI/FinCoT", split="SFT")
 
-def format_fin_cot(examples):
-    texts = []
-    # Identify available prompt and response keys
-    prompts = examples.get("instruction") or examples.get("question") or examples.get("input")
-    responses = examples.get("output") or examples.get("response") or examples.get("answer")
-    
-    # Handle optional extra context input if present
-    inputs = examples.get("input", [""] * len(prompts))
+print(f"Dataset columns detected: {dataset.column_names}")
 
-    for prompt, inp, response in zip(prompts, inputs, responses):
-        user_content = prompt if not inp or inp == prompt else f"{prompt}\n\nContext:\n{inp}"
-        
+def format_fin_cot(examples):
+    # Dynamic resolution for column names
+    prompt_keys = ["instruction", "prompt", "question", "problem", "input"]
+    target_prompt_key = next((k for k in prompt_keys if k in examples), None)
+
+    response_keys = ["output", "response", "solution", "cot", "answer", "reasoning"]
+    target_response_key = next((k for k in response_keys if k in examples), None)
+
+    if not target_prompt_key or not target_response_key:
+        raise KeyError(
+            f"Could not map dataset columns. Available keys: {list(examples.keys())}"
+        )
+
+    prompts = examples[target_prompt_key]
+    responses = examples[target_response_key]
+    has_input = "input" in examples and target_prompt_key != "input"
+
+    texts = []
+    for i in range(len(prompts)):
+        q = prompts[i] or ""
+        r = responses[i] or ""
+
+        if has_input and examples["input"][i]:
+            extra_ctx = examples["input"][i]
+            user_content = f"{q}\n\nContext:\n{extra_ctx}" if extra_ctx != q else q
+        else:
+            user_content = q
+
         messages = [
             {
                 "role": "user",
                 "content": f"Solve the following financial problem with step-by-step reasoning:\n{user_content}",
             },
-            {"role": "assistant", "content": response},
+            {"role": "assistant", "content": r},
         ]
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
         texts.append(text)
-        
+
     return {"text": texts}
 
+
 dataset = dataset.map(format_fin_cot, batched=True)
+
 # ==========================================
 # 5. SFT TRAINER WITH PROGRESS RETENTION
 # ==========================================
 output_directory = "outputs"
 
-# NOTE: per_device_train_batch_size kept at 2 since your MIG slice showed ~26GB
-# free after the existing ollama process. If you hit OOM, drop this to 1 and
-# raise gradient_accumulation_steps to 8 to keep the same effective batch size.
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
@@ -158,9 +173,8 @@ trainer = SFTTrainer(
         output_dir=output_directory,
         report_to="wandb",
         logging_dir=f"{output_directory}/runs",
-        # --- RESILIENCE CHECKPOINTS ---
         save_strategy="steps",
-        save_steps=10,  # Snapshot progress every 10 updates
+        save_steps=10,
         save_total_limit=2,
         load_best_model_at_end=False,
     ),
