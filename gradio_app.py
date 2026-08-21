@@ -172,4 +172,4 @@ with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
 # ==========================================
 if __name__ == "__main__":
     # share=True provides a public gradio.live URL accessible anywhere
-    demo.queue().launch(share=True, server_name="0.0.0.0", server_port=7860)
+    demo.queue().launch(share=True, server_name="0.0.0.0")
