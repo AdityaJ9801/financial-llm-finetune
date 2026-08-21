@@ -101,25 +101,31 @@ dataset = load_dataset("TheFinAI/FinCoT", split="SFT")
 
 def format_fin_cot(examples):
     texts = []
-    for question, computation_trace in zip(
-        examples["question"], examples["answer"]
-    ):
+    # Identify available prompt and response keys
+    prompts = examples.get("instruction") or examples.get("question") or examples.get("input")
+    responses = examples.get("output") or examples.get("response") or examples.get("answer")
+    
+    # Handle optional extra context input if present
+    inputs = examples.get("input", [""] * len(prompts))
+
+    for prompt, inp, response in zip(prompts, inputs, responses):
+        user_content = prompt if not inp or inp == prompt else f"{prompt}\n\nContext:\n{inp}"
+        
         messages = [
             {
                 "role": "user",
-                "content": f"Solve the following financial problem with step-by-step reasoning:\n{question}",
+                "content": f"Solve the following financial problem with step-by-step reasoning:\n{user_content}",
             },
-            {"role": "assistant", "content": computation_trace},
+            {"role": "assistant", "content": response},
         ]
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False
         )
         texts.append(text)
+        
     return {"text": texts}
 
-
 dataset = dataset.map(format_fin_cot, batched=True)
-
 # ==========================================
 # 5. SFT TRAINER WITH PROGRESS RETENTION
 # ==========================================
