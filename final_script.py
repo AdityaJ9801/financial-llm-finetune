@@ -97,8 +97,7 @@ model = FastLanguageModel.get_peft_model(
 # ==========================================
 # 4. DATASET UTILITIES
 # ==========================================
-dataset = load_dataset("TheFinAI/FinCoT", split="train")
-
+dataset = load_dataset("TheFinAI/FinCoT", split="SFT")
 
 def format_fin_cot(examples):
     texts = []
