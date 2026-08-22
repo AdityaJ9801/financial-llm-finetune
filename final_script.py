@@ -2,6 +2,7 @@
 # 0. DEPLOYED TOP-LEVEL IMPORTS (MANDATORY FOR UNSLOTH)
 # ==========================================
 from unsloth import FastLanguageModel
+from unsloth.chat_templates import get_chat_template, train_on_responses_only
 
 import os
 import torch
@@ -18,45 +19,31 @@ def preflight_check():
     cap = torch.cuda.get_device_capability(0)
     name = torch.cuda.get_device_name(0)
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    print(f"GPU: {name}")
-    print(f"Compute capability: {cap} (Blackwell B200 should report (10, 0))")
-    print(f"Visible memory to this process: {total_mem_gb:.1f} GB")
-    if cap[0] < 10:
-        print(
-            "WARNING: compute capability below (10, 0) — your torch/CUDA build may "
-            "predate Blackwell support. bitsandbytes 4-bit kernels may fail or fall "
-            "back to slow paths."
-        )
-    if total_mem_gb < 30:
-        print(
-            "WARNING: visible memory is well under a full B200's 180GB — this looks "
-            "like a MIG slice with another workload already resident. Consider "
-            "reducing per_device_train_batch_size or max_seq_length if you hit OOM."
-        )
-
+    print(f"GPU: {name} (Compute Capability: {cap})")
+    print(f"Visible memory: {total_mem_gb:.1f} GB")
 
 preflight_check()
 
 # ==========================================
-# 1. WEIGHTS & BIASES INITIALIZATION
+# 1. INITIALIZE W&B
 # ==========================================
 run = wandb.init(
     entity="aditya_1976-shri-ramdeobaba-college-of-engineering-and-m",
     project="Financial finetuning model",
     config={
-        "learning_rate": 2e-4,
+        "learning_rate": 1e-4,
         "architecture": "Gemma-2-9b-it (LoRA)",
         "dataset": "TheFinAI/FinCoT",
-        "max_steps": 60,
+        "max_steps": 250,
         "batch_size": 2,
         "gradient_accumulation_steps": 4,
     },
 )
 
 # ==========================================
-# 2. CONFIGURATION & B200 CUDA 12.8 RUNTIME ADAPTATIONS
+# 2. MODEL & TOKENIZER CONFIGURATION
 # ==========================================
-max_seq_length = 4096
+max_seq_length = 2048  # 2048 is optimal for FinCoT and speeds up training
 dtype = torch.bfloat16
 load_in_4bit = True
 
@@ -67,8 +54,14 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     load_in_4bit=load_in_4bit,
 )
 
+# Apply correct Gemma chat template formatting
+tokenizer = get_chat_template(
+    tokenizer,
+    chat_template="gemma",
+)
+
 # ==========================================
-# 3. PEFT / LORA TARGET PARAMETERS
+# 3. PEFT / LORA SETUP
 # ==========================================
 model = FastLanguageModel.get_peft_model(
     model,
@@ -87,8 +80,6 @@ model = FastLanguageModel.get_peft_model(
     bias="none",
     use_gradient_checkpointing="unsloth",
     random_state=3407,
-    use_rslora=False,
-    loftq_config=None,
 )
 
 # ==========================================
@@ -99,18 +90,18 @@ dataset = load_dataset("TheFinAI/FinCoT", split="SFT")
 def format_fin_cot(examples):
     texts = []
     questions = examples["Question"]
-    reasoning_traces = examples["Reasoning_process"]
-    final_answers = examples["Final_response"]
+    reasonings = examples["Reasoning_process"]
+    finals = examples["Final_response"]
 
-    for q, r, f in zip(questions, reasoning_traces, final_answers):
-        # Format the Assistant's full Chain-of-Thought output
-        assistant_content = f"{r}\n\n{f}"
+    for q, r, f in zip(questions, reasonings, finals):
+        # Format the model's full Chain of Thought
+        assistant_content = f"{r}\n\nFinal Answer: {f}"
 
         messages = [
-            {"role": "user", "content": q},
-            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": q.strip()},
+            {"role": "assistant", "content": assistant_content.strip()},
         ]
-        
+
         text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -120,7 +111,6 @@ def format_fin_cot(examples):
 
     return {"text": texts}
 
-# Apply formatting and drop unneeded columns to save RAM/VRAM
 dataset = dataset.map(
     format_fin_cot,
     batched=True,
@@ -128,7 +118,7 @@ dataset = dataset.map(
 )
 
 # ==========================================
-# 5. SFT TRAINER WITH PROGRESS RETENTION
+# 5. SFT TRAINER WITH RESPONSE-ONLY MASKING
 # ==========================================
 output_directory = "outputs"
 
@@ -143,41 +133,34 @@ trainer = SFTTrainer(
     args=TrainingArguments(
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
-        warmup_steps=10,
-        max_steps=60,
-        learning_rate=2e-4,
+        warmup_steps=20,
+        max_steps=250,          # Increased from 60 to 250 for actual convergence
+        learning_rate=1e-4,     # Lowered from 2e-4 to prevent mode collapse on 9B
         bf16=True,
         fp16=False,
         logging_steps=1,
         optim="adamw_8bit",
         weight_decay=0.01,
-        lr_scheduler_type="linear",
+        lr_scheduler_type="cosine",
         seed=3407,
         output_dir=output_directory,
         report_to="wandb",
-        logging_dir=f"{output_directory}/runs",
         save_strategy="steps",
-        save_steps=10,
+        save_steps=50,
         save_total_limit=2,
-        load_best_model_at_end=False,
     ),
 )
 
-# Recover from sudden terminal closures if checkpoint objects are found
-checkpoint_exists = False
-if os.path.exists(output_directory):
-    checkpoints = [
-        d for d in os.listdir(output_directory) if d.startswith("checkpoint-")
-    ]
-    if checkpoints:
-        checkpoint_exists = True
+# Mask loss on user prompts so the model only learns assistant completions
+trainer = train_on_responses_only(
+    trainer,
+    instruction_part="<start_of_turn>user\n",
+    response_part="<start_of_turn>model\n",
+)
 
-if checkpoint_exists:
-    print(f"Resuming background pipeline execution from: {output_directory}")
-    trainer_stats = trainer.train(resume_from_checkpoint=True)
-else:
-    print("Starting a clean execution sequence...")
-    trainer_stats = trainer.train()
+# Run training
+print("Starting fine-tuning...")
+trainer_stats = trainer.train()
 
 run.finish()
 
@@ -186,4 +169,4 @@ run.finish()
 # ==========================================
 model.save_pretrained("gemma2_9b_fincot_adapters")
 tokenizer.save_pretrained("gemma2_9b_fincot_adapters")
-print("Process completed successfully.")
+print("Model fine-tuned and saved successfully!")
