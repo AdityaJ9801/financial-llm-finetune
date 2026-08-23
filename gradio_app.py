@@ -1,38 +1,51 @@
 from threading import Thread
+
 import gradio as gr
 import torch
 from transformers import TextIteratorStreamer
 from unsloth import FastLanguageModel
 
 
-# ==========================================
+# ============================================================
 # 1. CONFIGURATION
-# ==========================================
+# ============================================================
 
 MODEL_NAME = "gemma2_9b_fincot_adapters"
+
 MAX_SEQ_LENGTH = 4096
 LOAD_IN_4BIT = True
 
-# Use bfloat16 if supported, otherwise float16
-if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-    DTYPE = torch.bfloat16
+# Select appropriate dtype
+if torch.cuda.is_available():
+    if torch.cuda.is_bf16_supported():
+        DTYPE = torch.bfloat16
+    else:
+        DTYPE = torch.float16
 else:
-    DTYPE = torch.float16
+    DTYPE = torch.float32
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-print("=" * 60)
+
+print("=" * 70)
 print("Financial LLM - Starting")
-print("=" * 60)
-print(f"Device: {DEVICE}")
-print(f"Dtype: {DTYPE}")
-print(f"Model: {MODEL_NAME}")
-print("=" * 60)
+print("=" * 70)
+
+print(f"Model       : {MODEL_NAME}")
+print(f"Device      : {DEVICE}")
+print(f"Dtype       : {DTYPE}")
+print(f"4-bit       : {LOAD_IN_4BIT}")
+print(f"Max length  : {MAX_SEQ_LENGTH}")
+
+if torch.cuda.is_available():
+    print(f"GPU         : {torch.cuda.get_device_name(0)}")
+
+print("=" * 70)
 
 
-# ==========================================
-# 2. LOAD MODEL & TOKENIZER
-# ==========================================
+# ============================================================
+# 2. LOAD MODEL
+# ============================================================
 
 print("\nLoading fine-tuned financial model...")
 
@@ -48,7 +61,7 @@ print("Model loaded successfully.")
 # Enable Unsloth optimized inference
 FastLanguageModel.for_inference(model)
 
-# Make sure padding token exists
+# Ensure padding token exists
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -56,9 +69,9 @@ print("Tokenizer configured.")
 print("Model ready for inference.\n")
 
 
-# ==========================================
-# 3. STREAMING INFERENCE
-# ==========================================
+# ============================================================
+# 3. GENERATION FUNCTION
+# ============================================================
 
 def generate_response(
     prompt: str,
@@ -70,9 +83,9 @@ def generate_response(
     financial language model.
     """
 
-    # --------------------------------------
-    # Validate prompt
-    # --------------------------------------
+    # --------------------------------------------------------
+    # Validate input
+    # --------------------------------------------------------
 
     if prompt is None or not prompt.strip():
         yield "Please enter a financial problem or context to analyze."
@@ -80,11 +93,13 @@ def generate_response(
 
     prompt = prompt.strip()
 
+    generation_thread = None
+
     try:
 
-        # ----------------------------------
-        # Chat messages
-        # ----------------------------------
+        # ----------------------------------------------------
+        # Create chat messages
+        # ----------------------------------------------------
 
         messages = [
             {
@@ -93,9 +108,9 @@ def generate_response(
             }
         ]
 
-        # ----------------------------------
-        # Tokenize using Gemma chat template
-        # ----------------------------------
+        # ----------------------------------------------------
+        # Apply Gemma chat template
+        # ----------------------------------------------------
 
         model_inputs = tokenizer.apply_chat_template(
             messages,
@@ -105,21 +120,18 @@ def generate_response(
             return_dict=True,
         )
 
-        # Move tensors to GPU/CPU
-        if torch.cuda.is_available():
-            model_inputs = {
-                key: value.to("cuda")
-                for key, value in model_inputs.items()
-            }
-        else:
-            model_inputs = {
-                key: value.to("cpu")
-                for key, value in model_inputs.items()
-            }
+        # ----------------------------------------------------
+        # Move tensors to correct device
+        # ----------------------------------------------------
 
-        # ----------------------------------
-        # Streaming tokenizer
-        # ----------------------------------
+        model_inputs = {
+            key: value.to(DEVICE)
+            for key, value in model_inputs.items()
+        }
+
+        # ----------------------------------------------------
+        # Create streamer
+        # ----------------------------------------------------
 
         streamer = TextIteratorStreamer(
             tokenizer,
@@ -128,14 +140,14 @@ def generate_response(
             skip_special_tokens=True,
         )
 
-        # ----------------------------------
+        # ----------------------------------------------------
         # Generation parameters
-        # ----------------------------------
+        # ----------------------------------------------------
 
         temperature = float(temperature)
         max_tokens = int(max_tokens)
 
-        generate_kwargs = {
+        generation_kwargs = {
             **model_inputs,
             "streamer": streamer,
             "max_new_tokens": max_tokens,
@@ -147,34 +159,41 @@ def generate_response(
             "eos_token_id": tokenizer.eos_token_id,
         }
 
-        # ----------------------------------
-        # Run generation in background thread
-        # ----------------------------------
+        # ----------------------------------------------------
+        # Start generation in background thread
+        # ----------------------------------------------------
 
         generation_thread = Thread(
             target=model.generate,
-            kwargs=generate_kwargs,
+            kwargs=generation_kwargs,
             daemon=True,
         )
 
         generation_thread.start()
 
-        # ----------------------------------
-        # Stream generated tokens
-        # ----------------------------------
+        # ----------------------------------------------------
+        # Stream output
+        # ----------------------------------------------------
 
         partial_text = ""
 
         for new_text in streamer:
+
             partial_text += new_text
+
             yield partial_text
 
-        generation_thread.join(timeout=5)
+        # Wait briefly for generation thread
+        if generation_thread.is_alive():
+            generation_thread.join(timeout=5)
 
     except Exception as e:
 
-        print("\nGeneration error:")
+        print("\n" + "=" * 70)
+        print("GENERATION ERROR")
+        print("=" * 70)
         print(str(e))
+        print("=" * 70)
 
         yield (
             "An error occurred while generating the response.\n\n"
@@ -182,9 +201,9 @@ def generate_response(
         )
 
 
-# ==========================================
-# 4. EXAMPLE QUESTIONS
-# ==========================================
+# ============================================================
+# 4. EXAMPLE PROMPTS
+# ============================================================
 
 default_examples = [
 
@@ -193,15 +212,15 @@ default_examples = [
             "Please answer the given financial question based on the context.\n\n"
             "Context: amortization expense, which is included in selling, "
             "general and administrative expenses, was $13.0 million, "
-            "$13.9 million and $8.5 million for the years ended "
-            "December 31, 2016, 2015 and 2014, respectively.\n\n"
+            "$13.9 million and $8.5 million for the years ended December 31, "
+            "2016, 2015 and 2014, respectively.\n\n"
             "The estimated amortization expense is:\n"
             "2017: $12.5M\n"
             "2018: $11.0M\n"
             "2019: $9.2M\n"
-            "2020: $8.0M\n\n"
-            "Question: What is the cumulative amortization expense "
-            "estimated for the two-year period from 2017 to 2018?"
+            "2020: $8.0M.\n\n"
+            "Question: What is the cumulative amortization expense estimated "
+            "for the two-year period from 2017 to 2018?"
         ),
         0.1,
         1024,
@@ -210,14 +229,14 @@ default_examples = [
     [
         (
             "Please answer the given financial question based on the context.\n\n"
-            "Context: In FY2023, Company Alpha reported total revenue "
-            "of $850 million, cost of goods sold (COGS) of $510 million, "
+            "Context: In FY2023, Company Alpha reported total revenue of "
+            "$850 million, cost of goods sold (COGS) of $510 million, "
             "and operating expenses of $170 million.\n\n"
-            "In FY2022, total revenue was $700 million with an "
-            "operating margin of 18%.\n\n"
-            "Question: What is Company Alpha's operating margin for "
-            "FY2023, and by how many basis points did it expand or "
-            "contract compared to FY2022?"
+            "In FY2022, total revenue was $700 million with an operating "
+            "margin of 18%.\n\n"
+            "Question: What is Company Alpha's operating margin for FY2023, "
+            "and by how many basis points did it expand or contract "
+            "compared to FY2022?"
         ),
         0.1,
         1024,
@@ -240,9 +259,9 @@ default_examples = [
 ]
 
 
-# ==========================================
+# ============================================================
 # 5. CUSTOM CSS
-# ==========================================
+# ============================================================
 
 custom_css = """
 #output_box {
@@ -257,44 +276,53 @@ custom_css = """
 textarea {
     font-family: monospace !important;
 }
-
-#title {
-    text-align: center;
-}
 """
 
 
-# ==========================================
-# 6. GRADIO UI
-# ==========================================
+# ============================================================
+# 6. GRADIO APPLICATION
+# ============================================================
+#
+# IMPORTANT FOR GRADIO 6.x:
+#
+# DO NOT:
+#
+# gr.Blocks(theme=..., css=...)
+#
+# theme and css are passed to launch().
+#
+# ============================================================
 
 with gr.Blocks() as demo:
 
-    # --------------------------------------
+    # --------------------------------------------------------
     # Header
-    # --------------------------------------
+    # --------------------------------------------------------
 
     gr.Markdown(
         """
-        # 📊 Gemma-2-9B Financial Model
+# 📊 Gemma-2-9B Financial Model
 
-        ### Fine-tuned Financial Question Answering
+### Fine-Tuned Financial Question Answering
 
-        Enter a financial problem, provide the context, and let the
-        fine-tuned model calculate and explain the answer.
-        """,
-        elem_id="title",
+Enter a financial problem and context below. The fine-tuned
+model will generate a financial solution.
+"""
     )
 
-    # --------------------------------------
+    gr.Markdown(
+        "Select an example or enter your own financial question."
+    )
+
+    # --------------------------------------------------------
     # Main layout
-    # --------------------------------------
+    # --------------------------------------------------------
 
     with gr.Row():
 
-        # ==================================
+        # ====================================================
         # LEFT COLUMN
-        # ==================================
+        # ====================================================
 
         with gr.Column(scale=5):
 
@@ -302,16 +330,17 @@ with gr.Blocks() as demo:
                 label="Financial Question / Context",
                 lines=12,
                 placeholder=(
-                    "Enter your financial context and question here...\n\n"
+                    "Enter financial context and question here...\n\n"
                     "Example:\n"
-                    "Company revenue was $100M and expenses were $70M.\n"
-                    "What was the company's operating margin?"
+                    "Revenue = $100M\n"
+                    "Operating expenses = $70M\n\n"
+                    "Question: What is the operating margin?"
                 ),
             )
 
-            # ----------------------------------
-            # Generation controls
-            # ----------------------------------
+            # ------------------------------------------------
+            # Controls
+            # ------------------------------------------------
 
             with gr.Row():
 
@@ -321,7 +350,7 @@ with gr.Blocks() as demo:
                     value=0.1,
                     step=0.05,
                     label="Temperature",
-                    info="Lower values produce more deterministic answers.",
+                    info="Lower = more deterministic",
                 )
 
                 max_tokens_slider = gr.Slider(
@@ -330,27 +359,11 @@ with gr.Blocks() as demo:
                     value=1024,
                     step=64,
                     label="Max New Tokens",
-                    info="Maximum number of tokens generated.",
                 )
 
-            # ----------------------------------
-            # Buttons
-            # ----------------------------------
-
-            with gr.Row():
-
-                submit_btn = gr.Button(
-                    "Analyze & Solve",
-                    variant="primary",
-                )
-
-                clear_btn = gr.ClearButton(
-                    value="Clear",
-                )
-
-        # ==================================
+        # ====================================================
         # RIGHT COLUMN
-        # ==================================
+        # ====================================================
 
         with gr.Column(scale=5):
 
@@ -363,21 +376,36 @@ with gr.Blocks() as demo:
             )
 
 
-    # ======================================
-    # CLEAR BUTTON
-    # ======================================
+    # ========================================================
+    # BUTTONS
+    # ========================================================
 
-    clear_btn.add(
-        [
-            prompt_input,
-            output_display,
-        ]
-    )
+    with gr.Row():
+
+        submit_btn = gr.Button(
+            "Analyze & Solve",
+            variant="primary",
+        )
+
+        # IMPORTANT:
+        # Components are passed directly to ClearButton.
+        #
+        # DO NOT use:
+        #
+        # clear_btn.add(...)
+        #
+        clear_btn = gr.ClearButton(
+            [
+                prompt_input,
+                output_display,
+            ],
+            value="Clear",
+        )
 
 
-    # ======================================
-    # GENERATE BUTTON
-    # ======================================
+    # ========================================================
+    # GENERATE EVENT
+    # ========================================================
 
     submit_btn.click(
         fn=generate_response,
@@ -390,9 +418,9 @@ with gr.Blocks() as demo:
     )
 
 
-    # ======================================
+    # ========================================================
     # EXAMPLES
-    # ======================================
+    # ========================================================
 
     gr.Examples(
         examples=default_examples,
@@ -407,15 +435,15 @@ with gr.Blocks() as demo:
     )
 
 
-# ==========================================
-# 7. LAUNCH APPLICATION
-# ==========================================
+# ============================================================
+# 7. LAUNCH
+# ============================================================
 
 if __name__ == "__main__":
 
-    print("=" * 60)
-    print("Starting Gradio application...")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("Starting Gradio server...")
+    print("=" * 70)
 
     demo.queue(
         max_size=20,
@@ -423,6 +451,9 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         server_name="0.0.0.0",
+
+        # Gradio 6.x:
+        # theme and CSS MUST be supplied to launch()
         theme=gr.themes.Soft(),
         css=custom_css,
     )
