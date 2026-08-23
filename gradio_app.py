@@ -1,5 +1,4 @@
 from threading import Thread
-
 import gradio as gr
 import torch
 from transformers import TextIteratorStreamer
@@ -16,11 +15,7 @@ LOAD_IN_4BIT = True
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
-
-    if torch.cuda.is_bf16_supported():
-        DTYPE = torch.bfloat16
-    else:
-        DTYPE = torch.float16
+    DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 else:
     DEVICE = "cpu"
     DTYPE = torch.float32
@@ -73,13 +68,8 @@ print("Model ready.\n")
 # GENERATION FUNCTION
 # ============================================================
 
-def generate_response(
-    prompt,
-    temperature,
-    max_tokens,
-):
+def generate_response(prompt, temperature, max_tokens):
     """Generate a streaming response from the financial model."""
-
     if prompt is None or not prompt.strip():
         yield "Please enter a financial problem or context to analyze."
         return
@@ -87,22 +77,9 @@ def generate_response(
     prompt = prompt.strip()
 
     try:
+        messages = [{"role": "user", "content": prompt}]
 
-        # ----------------------------------------------------
-        # Create chat messages
-        # ----------------------------------------------------
-
-        messages = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
-
-        # ----------------------------------------------------
-        # Apply Gemma chat template
-        # ----------------------------------------------------
-
+        # Apply chat template
         model_inputs = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -111,18 +88,11 @@ def generate_response(
             return_dict=True,
         )
 
-        # ----------------------------------------------------
-        # Move tensors to device
-        # ----------------------------------------------------
-
-        model_inputs = {
-            key: value.to(DEVICE)
-            for key, value in model_inputs.items()
-        }
-
-        # ----------------------------------------------------
-        # Create streamer
-        # ----------------------------------------------------
+        # Move tensors to target device safely
+        if isinstance(model_inputs, dict):
+            model_inputs = {key: value.to(DEVICE) for key, value in model_inputs.items()}
+        else:
+            model_inputs = {"input_ids": model_inputs.to(DEVICE)}
 
         streamer = TextIteratorStreamer(
             tokenizer,
@@ -131,10 +101,6 @@ def generate_response(
             skip_special_tokens=True,
         )
 
-        # ----------------------------------------------------
-        # Generation settings
-        # ----------------------------------------------------
-
         temperature = float(temperature)
         max_tokens = int(max_tokens)
 
@@ -142,54 +108,39 @@ def generate_response(
             **model_inputs,
             "streamer": streamer,
             "max_new_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": 0.9,
+            "temperature": temperature if temperature > 0.0 else None,
+            "top_p": 0.9 if temperature > 0.0 else None,
             "do_sample": temperature > 0.0,
             "use_cache": True,
             "pad_token_id": tokenizer.pad_token_id,
             "eos_token_id": tokenizer.eos_token_id,
         }
 
-        # ----------------------------------------------------
-        # Generate in background thread
-        # ----------------------------------------------------
+        # Filter out None values for deterministic greedy generation
+        generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
 
         generation_thread = Thread(
             target=model.generate,
             kwargs=generation_kwargs,
             daemon=True,
         )
-
         generation_thread.start()
 
-        # ----------------------------------------------------
-        # Stream generated text
-        # ----------------------------------------------------
-
         generated_text = ""
-
         for new_text in streamer:
             generated_text += new_text
             yield generated_text
 
-        # ----------------------------------------------------
-        # Wait for thread
-        # ----------------------------------------------------
-
         generation_thread.join(timeout=5)
 
     except Exception as error:
-
         print("\n" + "=" * 70)
         print("GENERATION ERROR")
         print("=" * 70)
         print(error)
         print("=" * 70)
 
-        yield (
-            "Generation failed.\n\n"
-            f"Error: {error}"
-        )
+        yield f"Generation failed.\n\nError: {error}"
 
 
 # ============================================================
@@ -250,9 +201,9 @@ default_examples = [
 # ============================================================
 
 custom_css = """
-#output_box {
-    font-family: monospace;
-    font-size: 14px;
+#output_box textarea {
+    font-family: monospace !important;
+    font-size: 14px !important;
 }
 
 .gradio-container {
@@ -268,59 +219,28 @@ textarea {
 # ============================================================
 # GRADIO UI
 # ============================================================
-#
-# IMPORTANT:
-#
-# Gradio 6.x does NOT use:
-#
-# gr.Blocks(theme=..., css=...)
-#
-# Therefore theme/css are NOT passed here.
-#
-# ============================================================
 
-with gr.Blocks() as demo:
-
-    # --------------------------------------------------------
-    # Header
-    # --------------------------------------------------------
+with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
 
     gr.Markdown(
         """
 # 📊 Gemma-2-9B Financial Model
-
 ### Fine-Tuned Financial Question Answering
-
 Enter financial context and a question to generate a solution.
 """
     )
 
-    gr.Markdown(
-        "You can select an example below or enter your own question."
-    )
-
-    # --------------------------------------------------------
-    # Main layout
-    # --------------------------------------------------------
+    gr.Markdown("You can select an example below or enter your own question.")
 
     with gr.Row():
-
-        # ====================================================
-        # INPUT COLUMN
-        # ====================================================
-
         with gr.Column(scale=5):
-
             prompt_input = gr.Textbox(
                 label="Financial Question / Context",
                 lines=12,
-                placeholder=(
-                    "Enter your financial context and question here..."
-                ),
+                placeholder="Enter your financial context and question here...",
             )
 
             with gr.Row():
-
                 temperature_slider = gr.Slider(
                     minimum=0.0,
                     maximum=1.0,
@@ -338,12 +258,7 @@ Enter financial context and a question to generate a solution.
                     label="Max New Tokens",
                 )
 
-        # ====================================================
-        # OUTPUT COLUMN
-        # ====================================================
-
         with gr.Column(scale=5):
-
             output_display = gr.Textbox(
                 label="Financial Solution",
                 lines=18,
@@ -352,36 +267,9 @@ Enter financial context and a question to generate a solution.
                 show_copy_button=True,
             )
 
-    # --------------------------------------------------------
-    # Buttons
-    # --------------------------------------------------------
-
     with gr.Row():
-
-        submit_btn = gr.Button(
-            "Analyze & Solve",
-            variant="primary",
-        )
-
-        # IMPORTANT:
-        #
-        # Do NOT use:
-        #
-        # clear_btn.add(...)
-        #
-        # Components are passed directly to ClearButton.
-        #
-        clear_btn = gr.ClearButton(
-            [
-                prompt_input,
-                output_display,
-            ],
-            value="Clear",
-        )
-
-    # --------------------------------------------------------
-    # Submit event
-    # --------------------------------------------------------
+        submit_btn = gr.Button("Analyze & Solve", variant="primary")
+        clear_btn = gr.ClearButton([prompt_input, output_display], value="Clear")
 
     submit_btn.click(
         fn=generate_response,
@@ -392,10 +280,6 @@ Enter financial context and a question to generate a solution.
         ],
         outputs=output_display,
     )
-
-    # --------------------------------------------------------
-    # Examples
-    # --------------------------------------------------------
 
     gr.Examples(
         examples=default_examples,
@@ -415,7 +299,6 @@ Enter financial context and a question to generate a solution.
 # ============================================================
 
 if __name__ == "__main__":
-
     print("\n" + "=" * 70)
     print("Starting Gradio server...")
     print("=" * 70)
@@ -426,6 +309,4 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         server_name="0.0.0.0",
-        theme=gr.themes.Soft(),
-        css=custom_css,
     )
