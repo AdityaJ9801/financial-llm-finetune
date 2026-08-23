@@ -116,7 +116,7 @@ def generate_response(prompt, temperature, max_tokens):
             "eos_token_id": tokenizer.eos_token_id,
         }
 
-        # Filter out None values for deterministic greedy generation
+        # Filter out None values for greedy generation
         generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
 
         generation_thread = Thread(
@@ -220,7 +220,7 @@ textarea {
 # GRADIO UI
 # ============================================================
 
-with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
+with gr.Blocks() as demo:
 
     gr.Markdown(
         """
@@ -264,7 +264,7 @@ Enter financial context and a question to generate a solution.
                 lines=18,
                 elem_id="output_box",
                 interactive=False,
-                show_copy_button=True,
+                buttons=["copy"],
             )
 
     with gr.Row():
@@ -309,4 +309,6 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         server_name="0.0.0.0",
+        theme=gr.themes.Soft(),
+        css=custom_css,
     )
