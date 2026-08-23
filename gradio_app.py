@@ -7,44 +7,46 @@ from unsloth import FastLanguageModel
 
 
 # ============================================================
-# 1. CONFIGURATION
+# CONFIGURATION
 # ============================================================
 
 MODEL_NAME = "gemma2_9b_fincot_adapters"
-
 MAX_SEQ_LENGTH = 4096
 LOAD_IN_4BIT = True
 
-# Select appropriate dtype
 if torch.cuda.is_available():
+    DEVICE = "cuda"
+
     if torch.cuda.is_bf16_supported():
         DTYPE = torch.bfloat16
     else:
         DTYPE = torch.float16
 else:
+    DEVICE = "cpu"
     DTYPE = torch.float32
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ============================================================
+# STARTUP INFORMATION
+# ============================================================
 
 print("=" * 70)
-print("Financial LLM - Starting")
+print("FINANCIAL LLM")
 print("=" * 70)
-
-print(f"Model       : {MODEL_NAME}")
-print(f"Device      : {DEVICE}")
-print(f"Dtype       : {DTYPE}")
-print(f"4-bit       : {LOAD_IN_4BIT}")
-print(f"Max length  : {MAX_SEQ_LENGTH}")
+print(f"Model      : {MODEL_NAME}")
+print(f"Device     : {DEVICE}")
+print(f"Dtype      : {DTYPE}")
+print(f"4-bit      : {LOAD_IN_4BIT}")
+print(f"Max Length : {MAX_SEQ_LENGTH}")
 
 if torch.cuda.is_available():
-    print(f"GPU         : {torch.cuda.get_device_name(0)}")
+    print(f"GPU        : {torch.cuda.get_device_name(0)}")
 
 print("=" * 70)
 
 
 # ============================================================
-# 2. LOAD MODEL
+# LOAD MODEL
 # ============================================================
 
 print("\nLoading fine-tuned financial model...")
@@ -58,42 +60,31 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 
 print("Model loaded successfully.")
 
-# Enable Unsloth optimized inference
 FastLanguageModel.for_inference(model)
 
-# Ensure padding token exists
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
 print("Tokenizer configured.")
-print("Model ready for inference.\n")
+print("Model ready.\n")
 
 
 # ============================================================
-# 3. GENERATION FUNCTION
+# GENERATION FUNCTION
 # ============================================================
 
 def generate_response(
-    prompt: str,
-    temperature: float,
-    max_tokens: int,
+    prompt,
+    temperature,
+    max_tokens,
 ):
-    """
-    Generate a streaming response from the fine-tuned
-    financial language model.
-    """
-
-    # --------------------------------------------------------
-    # Validate input
-    # --------------------------------------------------------
+    """Generate a streaming response from the financial model."""
 
     if prompt is None or not prompt.strip():
         yield "Please enter a financial problem or context to analyze."
         return
 
     prompt = prompt.strip()
-
-    generation_thread = None
 
     try:
 
@@ -121,7 +112,7 @@ def generate_response(
         )
 
         # ----------------------------------------------------
-        # Move tensors to correct device
+        # Move tensors to device
         # ----------------------------------------------------
 
         model_inputs = {
@@ -141,7 +132,7 @@ def generate_response(
         )
 
         # ----------------------------------------------------
-        # Generation parameters
+        # Generation settings
         # ----------------------------------------------------
 
         temperature = float(temperature)
@@ -160,7 +151,7 @@ def generate_response(
         }
 
         # ----------------------------------------------------
-        # Start generation in background thread
+        # Generate in background thread
         # ----------------------------------------------------
 
         generation_thread = Thread(
@@ -172,41 +163,40 @@ def generate_response(
         generation_thread.start()
 
         # ----------------------------------------------------
-        # Stream output
+        # Stream generated text
         # ----------------------------------------------------
 
-        partial_text = ""
+        generated_text = ""
 
         for new_text in streamer:
+            generated_text += new_text
+            yield generated_text
 
-            partial_text += new_text
+        # ----------------------------------------------------
+        # Wait for thread
+        # ----------------------------------------------------
 
-            yield partial_text
+        generation_thread.join(timeout=5)
 
-        # Wait briefly for generation thread
-        if generation_thread.is_alive():
-            generation_thread.join(timeout=5)
-
-    except Exception as e:
+    except Exception as error:
 
         print("\n" + "=" * 70)
         print("GENERATION ERROR")
         print("=" * 70)
-        print(str(e))
+        print(error)
         print("=" * 70)
 
         yield (
-            "An error occurred while generating the response.\n\n"
-            f"Error: {str(e)}"
+            "Generation failed.\n\n"
+            f"Error: {error}"
         )
 
 
 # ============================================================
-# 4. EXAMPLE PROMPTS
+# EXAMPLES
 # ============================================================
 
 default_examples = [
-
     [
         (
             "Please answer the given financial question based on the context.\n\n"
@@ -214,18 +204,17 @@ default_examples = [
             "general and administrative expenses, was $13.0 million, "
             "$13.9 million and $8.5 million for the years ended December 31, "
             "2016, 2015 and 2014, respectively.\n\n"
-            "The estimated amortization expense is:\n"
+            "Estimated amortization expense:\n"
             "2017: $12.5M\n"
             "2018: $11.0M\n"
             "2019: $9.2M\n"
-            "2020: $8.0M.\n\n"
+            "2020: $8.0M\n\n"
             "Question: What is the cumulative amortization expense estimated "
             "for the two-year period from 2017 to 2018?"
         ),
         0.1,
         1024,
     ],
-
     [
         (
             "Please answer the given financial question based on the context.\n\n"
@@ -241,26 +230,23 @@ default_examples = [
         0.1,
         1024,
     ],
-
     [
         (
             "Please answer the given financial question based on the context.\n\n"
             "Context: As of Q4, ABC Corp holds $450 million in Total Debt "
-            "and $50 million in Cash & Cash Equivalents.\n\n"
-            "Its trailing twelve months (TTM) Adjusted EBITDA is "
-            "$100 million.\n\n"
+            "and $50 million in Cash & Cash Equivalents. "
+            "Its trailing twelve months (TTM) Adjusted EBITDA is $100 million.\n\n"
             "Question: Calculate the company's Net Debt and its "
             "Net Debt-to-EBITDA leverage ratio."
         ),
         0.1,
         1024,
     ],
-
 ]
 
 
 # ============================================================
-# 5. CUSTOM CSS
+# CSS
 # ============================================================
 
 custom_css = """
@@ -280,16 +266,16 @@ textarea {
 
 
 # ============================================================
-# 6. GRADIO APPLICATION
+# GRADIO UI
 # ============================================================
 #
-# IMPORTANT FOR GRADIO 6.x:
+# IMPORTANT:
 #
-# DO NOT:
+# Gradio 6.x does NOT use:
 #
 # gr.Blocks(theme=..., css=...)
 #
-# theme and css are passed to launch().
+# Therefore theme/css are NOT passed here.
 #
 # ============================================================
 
@@ -305,13 +291,12 @@ with gr.Blocks() as demo:
 
 ### Fine-Tuned Financial Question Answering
 
-Enter a financial problem and context below. The fine-tuned
-model will generate a financial solution.
+Enter financial context and a question to generate a solution.
 """
     )
 
     gr.Markdown(
-        "Select an example or enter your own financial question."
+        "You can select an example below or enter your own question."
     )
 
     # --------------------------------------------------------
@@ -321,7 +306,7 @@ model will generate a financial solution.
     with gr.Row():
 
         # ====================================================
-        # LEFT COLUMN
+        # INPUT COLUMN
         # ====================================================
 
         with gr.Column(scale=5):
@@ -330,17 +315,9 @@ model will generate a financial solution.
                 label="Financial Question / Context",
                 lines=12,
                 placeholder=(
-                    "Enter financial context and question here...\n\n"
-                    "Example:\n"
-                    "Revenue = $100M\n"
-                    "Operating expenses = $70M\n\n"
-                    "Question: What is the operating margin?"
+                    "Enter your financial context and question here..."
                 ),
             )
-
-            # ------------------------------------------------
-            # Controls
-            # ------------------------------------------------
 
             with gr.Row():
 
@@ -350,7 +327,7 @@ model will generate a financial solution.
                     value=0.1,
                     step=0.05,
                     label="Temperature",
-                    info="Lower = more deterministic",
+                    info="Lower values are more deterministic.",
                 )
 
                 max_tokens_slider = gr.Slider(
@@ -362,7 +339,7 @@ model will generate a financial solution.
                 )
 
         # ====================================================
-        # RIGHT COLUMN
+        # OUTPUT COLUMN
         # ====================================================
 
         with gr.Column(scale=5):
@@ -375,10 +352,9 @@ model will generate a financial solution.
                 show_copy_button=True,
             )
 
-
-    # ========================================================
-    # BUTTONS
-    # ========================================================
+    # --------------------------------------------------------
+    # Buttons
+    # --------------------------------------------------------
 
     with gr.Row():
 
@@ -388,11 +364,12 @@ model will generate a financial solution.
         )
 
         # IMPORTANT:
-        # Components are passed directly to ClearButton.
         #
-        # DO NOT use:
+        # Do NOT use:
         #
         # clear_btn.add(...)
+        #
+        # Components are passed directly to ClearButton.
         #
         clear_btn = gr.ClearButton(
             [
@@ -402,10 +379,9 @@ model will generate a financial solution.
             value="Clear",
         )
 
-
-    # ========================================================
-    # GENERATE EVENT
-    # ========================================================
+    # --------------------------------------------------------
+    # Submit event
+    # --------------------------------------------------------
 
     submit_btn.click(
         fn=generate_response,
@@ -417,10 +393,9 @@ model will generate a financial solution.
         outputs=output_display,
     )
 
-
-    # ========================================================
-    # EXAMPLES
-    # ========================================================
+    # --------------------------------------------------------
+    # Examples
+    # --------------------------------------------------------
 
     gr.Examples(
         examples=default_examples,
@@ -436,7 +411,7 @@ model will generate a financial solution.
 
 
 # ============================================================
-# 7. LAUNCH
+# LAUNCH
 # ============================================================
 
 if __name__ == "__main__":
@@ -451,9 +426,6 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         server_name="0.0.0.0",
-
-        # Gradio 6.x:
-        # theme and CSS MUST be supplied to launch()
         theme=gr.themes.Soft(),
         css=custom_css,
     )
