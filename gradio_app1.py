@@ -41,8 +41,7 @@ model = FastLanguageModel.get_peft_model(
 )
 
 # 3. Dataset
-dataset = load_dataset("TheFinAI/FinCoT", split="train")
-
+dataset = load_dataset("TheFinAI/FinCoT", split="SFT")
 # 4. Formatting
 EOS_TOKEN = tokenizer.eos_token
 
