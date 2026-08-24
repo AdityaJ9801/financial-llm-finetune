@@ -232,7 +232,7 @@ textarea {
 # GRADIO UI
 # ============================================================
 
-with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
+with gr.Blocks() as demo:
 
     gr.Markdown(
         """
@@ -276,7 +276,6 @@ Enter financial context and a question to generate a solution.
                 lines=18,
                 elem_id="output_box",
                 interactive=False,
-                show_copy_button=True,
             )
 
     with gr.Row():
@@ -321,4 +320,6 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         server_name="0.0.0.0",
+        theme=gr.themes.Soft(),
+        css=custom_css,
     )
