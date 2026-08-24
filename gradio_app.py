@@ -1,6 +1,5 @@
 from threading import Thread
 import os
-import re
 import gradio as gr
 import torch
 from transformers import TextIteratorStreamer
@@ -25,18 +24,16 @@ else:
     DEVICE = "cpu"
     DTYPE = torch.float32
 
-# Markers that signal the transition from reasoning -> final answer.
-# Tune these to match how YOUR fine-tuned model formats its output.
-FINAL_ANSWER_MARKERS = [
-    "Final Answer:",
-    "Final answer:",
-    "**Final Answer**",
-    "Final Response:",
-    "Answer:",
-    "Therefore,",
-    "In conclusion,",
-    "To conclude,",
-]
+# Must match the training format exactly.
+ANSWER_MARKER = "Final Answer:"
+REASONING_HEADER = "Reasoning:"
+
+# System prompt — MUST be identical to the one used during fine-tuning.
+SYSTEM_PROMPT = (
+    "You are a financial reasoning assistant. Work through the problem "
+    "step by step under \"Reasoning:\", then give the polished final answer "
+    "under \"Final Answer:\"."
+)
 
 
 # ============================================================
@@ -89,25 +86,23 @@ print("Model ready.\n")
 
 def split_reasoning_and_answer(text):
     """
-    Split generated text into (reasoning, final_answer).
-    Finds the earliest occurrence of any final-answer marker and splits there.
-    If no marker is found yet, everything is treated as reasoning so far.
+    Split generated text into (reasoning, final_answer) on the fixed
+    'Final Answer:' marker the model was trained to emit.
+    A leading 'Reasoning:' header is stripped from the reasoning panel.
+    If the marker hasn't appeared yet, everything is reasoning so far.
     """
-    earliest_idx = None
-    marker_len = 0
+    idx = text.find(ANSWER_MARKER)
+    if idx == -1:
+        reasoning = text
+        final_answer = ""
+    else:
+        reasoning = text[:idx]
+        final_answer = text[idx + len(ANSWER_MARKER):].strip()
 
-    for marker in FINAL_ANSWER_MARKERS:
-        idx = text.find(marker)
-        if idx != -1 and (earliest_idx is None or idx < earliest_idx):
-            earliest_idx = idx
-            marker_len = len(marker)
+    reasoning = reasoning.strip()
+    if reasoning.startswith(REASONING_HEADER):
+        reasoning = reasoning[len(REASONING_HEADER):].strip()
 
-    if earliest_idx is None:
-        return text.strip(), ""
-
-    reasoning = text[:earliest_idx].strip()
-    # Keep the answer text but drop the marker word itself for cleanliness
-    final_answer = text[earliest_idx + marker_len:].strip()
     return reasoning, final_answer
 
 
@@ -125,11 +120,7 @@ def generate_response(prompt, temperature, max_tokens):
 
     try:
         messages = [
-            {
-                "role": "system",
-                "content": "You are a financial reasoning assistant. "
-                           "Think step by step, then give the final answer.",
-            },
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
 
@@ -181,17 +172,15 @@ def generate_response(prompt, temperature, max_tokens):
         for new_text in streamer:
             generated_text += new_text
             reasoning, final_answer = split_reasoning_and_answer(generated_text)
-            # While no marker seen yet, show a placeholder in the answer box
-            answer_display = final_answer if final_answer else "…(generating reasoning)…"
+            answer_display = final_answer if final_answer else "…(reasoning in progress)…"
             yield reasoning, answer_display
 
         generation_thread.join(timeout=5)
 
-        # Final pass to clean up display
+        # Final cleanup pass
         reasoning, final_answer = split_reasoning_and_answer(generated_text)
         if not final_answer:
-            # No marker found — show everything as reasoning, note it in answer box
-            yield reasoning, "(No distinct final-answer marker detected — see reasoning.)"
+            yield reasoning, "(No 'Final Answer:' marker detected — see reasoning.)"
         else:
             yield reasoning, final_answer
 
