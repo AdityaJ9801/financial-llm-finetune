@@ -250,12 +250,12 @@ default_examples = [
 # ============================================================
 # CSS
 # ============================================================
-
 custom_css = """
 #reasoning_box textarea {
     font-family: monospace !important;
     font-size: 13px !important;
     background-color: #f7f7f9 !important;
+    color: #1a1a1a !important;
 }
 
 #answer_box textarea {
@@ -263,6 +263,7 @@ custom_css = """
     font-size: 15px !important;
     font-weight: 600 !important;
     background-color: #eef7ee !important;
+    color: #14532d !important;
 }
 
 .gradio-container {
