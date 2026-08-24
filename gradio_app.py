@@ -1,5 +1,6 @@
 from threading import Thread
 import os
+import re
 import gradio as gr
 import torch
 from transformers import TextIteratorStreamer
@@ -23,6 +24,19 @@ if torch.cuda.is_available():
 else:
     DEVICE = "cpu"
     DTYPE = torch.float32
+
+# Markers that signal the transition from reasoning -> final answer.
+# Tune these to match how YOUR fine-tuned model formats its output.
+FINAL_ANSWER_MARKERS = [
+    "Final Answer:",
+    "Final answer:",
+    "**Final Answer**",
+    "Final Response:",
+    "Answer:",
+    "Therefore,",
+    "In conclusion,",
+    "To conclude,",
+]
 
 
 # ============================================================
@@ -70,13 +84,41 @@ print("Model ready.\n")
 
 
 # ============================================================
+# SPLIT HELPER
+# ============================================================
+
+def split_reasoning_and_answer(text):
+    """
+    Split generated text into (reasoning, final_answer).
+    Finds the earliest occurrence of any final-answer marker and splits there.
+    If no marker is found yet, everything is treated as reasoning so far.
+    """
+    earliest_idx = None
+    marker_len = 0
+
+    for marker in FINAL_ANSWER_MARKERS:
+        idx = text.find(marker)
+        if idx != -1 and (earliest_idx is None or idx < earliest_idx):
+            earliest_idx = idx
+            marker_len = len(marker)
+
+    if earliest_idx is None:
+        return text.strip(), ""
+
+    reasoning = text[:earliest_idx].strip()
+    # Keep the answer text but drop the marker word itself for cleanliness
+    final_answer = text[earliest_idx + marker_len:].strip()
+    return reasoning, final_answer
+
+
+# ============================================================
 # GENERATION FUNCTION
 # ============================================================
 
 def generate_response(prompt, temperature, max_tokens):
-    """Generate a streaming response from the financial model."""
+    """Generate a streaming response, split into reasoning and final answer."""
     if prompt is None or not prompt.strip():
-        yield "Please enter a financial problem or context to analyze."
+        yield "Please enter a financial problem or context to analyze.", ""
         return
 
     prompt = prompt.strip()
@@ -91,7 +133,6 @@ def generate_response(prompt, temperature, max_tokens):
             {"role": "user", "content": prompt},
         ]
 
-        # Apply chat template
         model_inputs = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
@@ -100,7 +141,6 @@ def generate_response(prompt, temperature, max_tokens):
             return_dict=True,
         )
 
-        # Move tensors to target device safely
         if isinstance(model_inputs, dict):
             model_inputs = {key: value.to(DEVICE) for key, value in model_inputs.items()}
         else:
@@ -128,7 +168,6 @@ def generate_response(prompt, temperature, max_tokens):
             "eos_token_id": tokenizer.eos_token_id,
         }
 
-        # Filter out None values for greedy generation
         generation_kwargs = {k: v for k, v in generation_kwargs.items() if v is not None}
 
         generation_thread = Thread(
@@ -141,9 +180,20 @@ def generate_response(prompt, temperature, max_tokens):
         generated_text = ""
         for new_text in streamer:
             generated_text += new_text
-            yield generated_text
+            reasoning, final_answer = split_reasoning_and_answer(generated_text)
+            # While no marker seen yet, show a placeholder in the answer box
+            answer_display = final_answer if final_answer else "…(generating reasoning)…"
+            yield reasoning, answer_display
 
         generation_thread.join(timeout=5)
+
+        # Final pass to clean up display
+        reasoning, final_answer = split_reasoning_and_answer(generated_text)
+        if not final_answer:
+            # No marker found — show everything as reasoning, note it in answer box
+            yield reasoning, "(No distinct final-answer marker detected — see reasoning.)"
+        else:
+            yield reasoning, final_answer
 
     except Exception as error:
         print("\n" + "=" * 70)
@@ -152,7 +202,7 @@ def generate_response(prompt, temperature, max_tokens):
         print(error)
         print("=" * 70)
 
-        yield f"Generation failed.\n\nError: {error}"
+        yield f"Generation failed.\n\nError: {error}", ""
 
 
 # ============================================================
@@ -213,17 +263,21 @@ default_examples = [
 # ============================================================
 
 custom_css = """
-#output_box textarea {
+#reasoning_box textarea {
     font-family: monospace !important;
-    font-size: 14px !important;
+    font-size: 13px !important;
+    background-color: #f7f7f9 !important;
+}
+
+#answer_box textarea {
+    font-family: monospace !important;
+    font-size: 15px !important;
+    font-weight: 600 !important;
+    background-color: #eef7ee !important;
 }
 
 .gradio-container {
     max-width: 1400px !important;
-}
-
-textarea {
-    font-family: monospace !important;
 }
 """
 
@@ -238,17 +292,17 @@ with gr.Blocks() as demo:
         """
 # 📊 Llama-3.1-8B Financial Model
 ### Fine-Tuned Financial Question Answering (FinCoT)
-Enter financial context and a question to generate a solution.
+Enter financial context and a question. The model's **reasoning** and **final answer** are shown separately.
 """
     )
 
     gr.Markdown("You can select an example below or enter your own question.")
 
     with gr.Row():
-        with gr.Column(scale=5):
+        with gr.Column(scale=4):
             prompt_input = gr.Textbox(
                 label="Financial Question / Context",
-                lines=12,
+                lines=14,
                 placeholder="Enter your financial context and question here...",
             )
 
@@ -270,17 +324,29 @@ Enter financial context and a question to generate a solution.
                     label="Max New Tokens",
                 )
 
-        with gr.Column(scale=5):
-            output_display = gr.Textbox(
-                label="Financial Solution",
-                lines=18,
-                elem_id="output_box",
+            with gr.Row():
+                submit_btn = gr.Button("Analyze & Solve", variant="primary")
+
+        with gr.Column(scale=6):
+            reasoning_display = gr.Textbox(
+                label="🧠 Reasoning (step-by-step)",
+                lines=16,
+                elem_id="reasoning_box",
+                interactive=False,
+            )
+
+            answer_display = gr.Textbox(
+                label="✅ Final Answer",
+                lines=6,
+                elem_id="answer_box",
                 interactive=False,
             )
 
     with gr.Row():
-        submit_btn = gr.Button("Analyze & Solve", variant="primary")
-        clear_btn = gr.ClearButton([prompt_input, output_display], value="Clear")
+        clear_btn = gr.ClearButton(
+            [prompt_input, reasoning_display, answer_display],
+            value="Clear",
+        )
 
     submit_btn.click(
         fn=generate_response,
@@ -289,7 +355,7 @@ Enter financial context and a question to generate a solution.
             temperature_slider,
             max_tokens_slider,
         ],
-        outputs=output_display,
+        outputs=[reasoning_display, answer_display],
     )
 
     gr.Examples(
@@ -299,7 +365,7 @@ Enter financial context and a question to generate a solution.
             temperature_slider,
             max_tokens_slider,
         ],
-        outputs=output_display,
+        outputs=[reasoning_display, answer_display],
         fn=generate_response,
         cache_examples=False,
     )
