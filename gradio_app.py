@@ -1,4 +1,5 @@
 from threading import Thread
+import os
 import gradio as gr
 import torch
 from transformers import TextIteratorStreamer
@@ -9,9 +10,12 @@ from unsloth import FastLanguageModel
 # CONFIGURATION
 # ============================================================
 
-MODEL_NAME = "gemma2_9b_fincot_adapters"
+# Blackwell: make arch visible to any JIT-compiled kernels
+os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0"  # sm_100 = B200
+
+MODEL_NAME = "lora_model"          # LoRA adapter dir saved by the training script
 MAX_SEQ_LENGTH = 4096
-LOAD_IN_4BIT = True
+LOAD_IN_4BIT = False               # B200 has plenty of VRAM; run full bf16
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -36,6 +40,7 @@ print(f"Max Length : {MAX_SEQ_LENGTH}")
 
 if torch.cuda.is_available():
     print(f"GPU        : {torch.cuda.get_device_name(0)}")
+    print(f"Capability : {torch.cuda.get_device_capability(0)}")  # expect (10, 0) on B200
 
 print("=" * 70)
 
@@ -77,7 +82,14 @@ def generate_response(prompt, temperature, max_tokens):
     prompt = prompt.strip()
 
     try:
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a financial reasoning assistant. "
+                           "Think step by step, then give the final answer.",
+            },
+            {"role": "user", "content": prompt},
+        ]
 
         # Apply chat template
         model_inputs = tokenizer.apply_chat_template(
@@ -220,12 +232,12 @@ textarea {
 # GRADIO UI
 # ============================================================
 
-with gr.Blocks() as demo:
+with gr.Blocks(theme=gr.themes.Soft(), css=custom_css) as demo:
 
     gr.Markdown(
         """
-# 📊 Gemma-2-9B Financial Model
-### Fine-Tuned Financial Question Answering
+# 📊 Llama-3.1-8B Financial Model
+### Fine-Tuned Financial Question Answering (FinCoT)
 Enter financial context and a question to generate a solution.
 """
     )
@@ -264,7 +276,7 @@ Enter financial context and a question to generate a solution.
                 lines=18,
                 elem_id="output_box",
                 interactive=False,
-                buttons=["copy"],
+                show_copy_button=True,
             )
 
     with gr.Row():
@@ -309,6 +321,4 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         server_name="0.0.0.0",
-        theme=gr.themes.Soft(),
-        css=custom_css,
     )
