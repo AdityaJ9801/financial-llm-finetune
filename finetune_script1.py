@@ -1,7 +1,12 @@
 import os
 os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0"  # sm_100 = B200
 
+import io
 import re
+import json
+import zipfile
+import urllib.request
+
 import torch
 import wandb
 from unsloth import FastLanguageModel, is_bfloat16_supported
@@ -26,7 +31,7 @@ run = wandb.init(
     name="llama3.1-8b-fincot-math-sft",
     config={
         "base_model": "unsloth/Meta-Llama-3.1-8B-Instruct",
-        "datasets": ["TheFinAI/FinCoT", "ibm-research/finqa", "openai/gsm8k"],
+        "datasets": ["TheFinAI/FinCoT", "FinQA (github)", "openai/gsm8k"],
         "n_gsm8k": N_GSM8K, "n_finqa": N_FINQA,
         "lora_r": 16, "lora_alpha": 16,
         "learning_rate": 2e-4, "epochs": 1,
@@ -64,53 +69,56 @@ model = FastLanguageModel.get_peft_model(
 #    Every source becomes: Question / Reasoning_process / Final_response
 # ============================================================
 
-COMMON_COLS = ["Question", "Reasoning_process", "Final_response"]
-
 # --- 3a. FinCoT (already in the right schema — keep as is) ---
 fincot = load_dataset("TheFinAI/FinCoT", split="SFT")
 fincot = fincot.select_columns(["Question", "Reasoning_process", "Final_response"])
 print(f"FinCoT rows: {len(fincot)}")
 
 # --- 3b. FinQA (financial numeric reasoning) ---
-# FinQA schema: 'question', a reasoning 'program'/'gold_inds', and 'answer'/'exe_ans'.
-# Column names vary by mirror; we resolve them defensively.
-finqa_raw = load_dataset("ibm-research/finqa", split="train")
-print("FinQA columns:", finqa_raw.column_names)
+# The HF repo uses a loading script, which newer `datasets` refuses to run.
+# So we fetch the raw JSON straight from the FinQA GitHub repo instead.
+FINQA_ZIP_URL = "https://github.com/czyssrs/FinQA/archive/refs/heads/main.zip"
 
-def convert_finqa(ex):
-    # question field
-    question = ex.get("question") or ex.get("Question") or ""
-    # answer field (execution result preferred)
-    answer = (
-        ex.get("answer")
-        or ex.get("exe_ans")
-        or ex.get("final_result")
-        or ""
-    )
-    # reasoning: prefer human explanation / gold facts / program
-    reasoning = (
-        ex.get("explanation")
-        or ex.get("gold_inds")
-        or ex.get("program_re")
-        or ex.get("program")
-        or ""
-    )
-    # gold_inds may be a dict/list — flatten to text
-    if isinstance(reasoning, (list, dict)):
-        if isinstance(reasoning, dict):
-            reasoning = " ".join(str(v) for v in reasoning.values())
-        else:
-            reasoning = " ".join(str(v) for v in reasoning)
-    # prepend context if present so the model sees the evidence
-    context_parts = []
-    for key in ("pre_text", "post_text"):
-        val = ex.get(key)
-        if val:
-            context_parts.append(" ".join(val) if isinstance(val, list) else str(val))
-    table = ex.get("table")
-    if table:
-        context_parts.append(str(table))
-    context = "\n".join(context_parts).strip()
+def load_finqa_json(split_filename):
+    """Download the FinQA repo zip once and read a split's JSON file."""
+    print(f"Downloading FinQA archive for {split_filename} ...")
+    with urllib.request.urlopen(FINQA_ZIP_URL) as resp:
+        data = resp.read()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        inner = f"FinQA-main/dataset/{split_filename}"
+        with z.open(inner) as f:
+            return json.load(io.TextIOWrapper(f, encoding="utf-8"))
+
+finqa_train = load_finqa_json("train.json")
+print(f"FinQA raw examples: {len(finqa_train)}")
+
+def convert_finqa_example(example):
+    qa = example.get("qa", {})
+    question = qa.get("question", "")
+
+    # answer: 'answer' can be empty in some rows; fall back to last step result
+    answer = qa.get("answer", "")
+    if not answer:
+        steps = qa.get("steps", [])
+        if steps:
+            answer = str(steps[-1].get("res", ""))
+
+    # reasoning: prefer the gold supporting facts, then the program
+    gold_inds = qa.get("gold_inds", {})
+    if isinstance(gold_inds, dict):
+        reasoning_facts = " ".join(str(v) for v in gold_inds.values())
+    else:
+        reasoning_facts = " ".join(str(v) for v in gold_inds)
+    program = str(qa.get("program", ""))
+    reasoning = (reasoning_facts + ("\nProgram: " + program if program else "")).strip()
+
+    # context: pre_text + table + post_text
+    pre_text  = " ".join(example.get("pre_text", []) or [])
+    post_text = " ".join(example.get("post_text", []) or [])
+    table = example.get("table", [])
+    table_str = "\n".join(" | ".join(str(c) for c in row) for row in table) if table else ""
+
+    context = "\n".join(p for p in [pre_text, table_str, post_text] if p).strip()
 
     full_q = (
         "Please answer the given financial question based on the context.\n\n"
@@ -119,11 +127,12 @@ def convert_finqa(ex):
     )
     return {
         "Question": full_q,
-        "Reasoning_process": str(reasoning).strip(),
+        "Reasoning_process": reasoning,
         "Final_response": str(answer).strip(),
     }
 
-finqa = finqa_raw.map(convert_finqa, remove_columns=finqa_raw.column_names)
+finqa_rows = [convert_finqa_example(ex) for ex in finqa_train]
+finqa = Dataset.from_list(finqa_rows)
 finqa = finqa.filter(lambda x: x["Final_response"] and x["Question"])
 if N_FINQA:
     finqa = finqa.shuffle(seed=BLEND_SEED).select(range(min(N_FINQA, len(finqa))))
