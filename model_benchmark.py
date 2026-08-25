@@ -21,8 +21,6 @@ from datasets import load_dataset
 MODELS_TO_TEST = {
     "base":       "unsloth/Meta-Llama-3.1-8B-Instruct",
     "my_fincot":  "Aditya757864/llama3.1-8b-fincot",   # your deployed model
-    "fino1_ref":  "TheFinAI/Fino1-8B",                 # same-task published reference
-    # "fin_o1_ref": "TheFinAI/Fin-o1-8B",              # same-dataset reference (optional)
 }
 
 N_PER_BENCHMARK = 150          # samples per dataset; raise for tighter estimates
