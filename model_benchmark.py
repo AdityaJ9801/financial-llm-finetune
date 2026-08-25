@@ -7,6 +7,7 @@ import json
 import time
 import zipfile
 import urllib.request
+import numpy as np
 
 import torch
 import wandb
@@ -14,25 +15,25 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from unsloth import FastLanguageModel
 from datasets import load_dataset
-from peft import PeftModel  # Added import for PEFT adapter handling
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 MODELS_TO_TEST = {
     "base":       "unsloth/Meta-Llama-3.1-8B-Instruct",
-    "my_fincot":  "Aditya757864/llama3.1-8b-fincot",   # your deployed model
+    "my_fincot":  "Aditya757864/llama3.1-8b-fincot",   # your deployed adapter model
 }
 
-N_PER_BENCHMARK = 150          # samples per dataset; raise for tighter estimates
+N_PER_BENCHMARK = 150          # samples per dataset
 MAX_NEW_TOKENS  = 640
 NUM_TOLERANCE   = 0.01         # 1% relative tolerance for numeric match
-MAX_SEQ_LENGTH  = 8192         # raised from 4096 to fit larger FinQA contexts
+MAX_SEQ_LENGTH  = 8192         
+PRINT_FAILURES  = False        # Set to True to debug exact mismatches in the console
 
 # Weights & Biases
 WANDB_ENTITY  = "aditya_1976-shri-ramdeobaba-college-of-engineering-and-m"
 WANDB_PROJECT = "Financial finetuning model"
-USE_WANDB     = True
+USE_WANDB     = False          # Toggle True/False depending on if you want WandB tracking
 
 SYSTEM_PROMPT = (
     "You are a financial reasoning assistant. Work through the problem "
@@ -42,18 +43,20 @@ SYSTEM_PROMPT = (
 ANSWER_MARKER = "Final Answer:"
 
 # ============================================================
-# SHARED HELPERS
+# SHARED HELPERS & METRICS
 # ============================================================
 def extract_final_answer(text):
-    """Text after 'Final Answer:'; if absent, use the last non-empty line."""
+    """Extracts text exactly after 'Final Answer:'."""
     idx = text.find(ANSWER_MARKER)
     if idx != -1:
         return text[idx + len(ANSWER_MARKER):].strip()
-    # fallback for models that don't use our marker (e.g. reference models)
+    
+    # Fallback if marker is missing
     lines = [l for l in text.strip().splitlines() if l.strip()]
     return lines[-1].strip() if lines else text.strip()
 
 def extract_numbers(text):
+    # Strip common financial formatting symbols before regex
     cleaned = text.replace(",", "").replace("₹", "").replace("$", "").replace("%", "")
     nums = re.findall(r"-?\d+\.?\d*", cleaned)
     out = []
@@ -65,10 +68,13 @@ def extract_numbers(text):
     return out
 
 def numeric_match(pred, ref, tol=NUM_TOLERANCE):
-    """True if any predicted number is within tol of any reference number."""
-    pnums, rnums = extract_numbers(pred), extract_numbers(ref)
+    """Returns True if any predicted number is within 1% of any reference number."""
+    pnums = extract_numbers(pred)
+    rnums = extract_numbers(ref)
+    
     if not rnums:
-        return None  # no numeric reference -> caller falls back to text match
+        return None  # No numbers in reference, fallback to text match
+        
     for r in rnums:
         for p in pnums:
             if r == 0:
@@ -84,10 +90,9 @@ def text_match(pred, ref):
     return bool(r) and (r in p or p in r)
 
 # ============================================================
-# DATASET LOADERS  ->  each returns list of {"question","reference"}
+# DATASET LOADERS
 # ============================================================
 def load_finqa_test(n):
-    """FinQA test split — real financial numeric reasoning, unseen in training."""
     url = "https://github.com/czyssrs/FinQA/archive/refs/heads/main.zip"
     with urllib.request.urlopen(url) as resp:
         data = resp.read()
@@ -113,7 +118,6 @@ def load_finqa_test(n):
     return out
 
 def load_gsm8k_test(n):
-    """GSM8K test split — general multi-step arithmetic."""
     ds = load_dataset("openai/gsm8k", "main", split="test")
     out = []
     for ex in ds.select(range(min(n, len(ds)))):
@@ -122,38 +126,36 @@ def load_gsm8k_test(n):
     return out
 
 def load_fincot_holdout(n):
-    """Proxy in-domain set: tail slice of FinCoT SFT (see caveat in notes)."""
     ds = load_dataset("TheFinAI/FinCoT", split="SFT")
     tail = ds.select(range(max(0, len(ds) - n), len(ds)))
     return [{"question": r["Question"], "reference": (r["Final_response"] or "").strip()}
             for r in tail if r["Final_response"]]
 
 BENCHMARKS = {
-    "FinQA":  load_finqa_test,     # financial calc
-    "GSM8K":  load_gsm8k_test,     # general math
-    "FinCoT": load_fincot_holdout, # in-domain
+    "FinQA":  load_finqa_test,
+    "GSM8K":  load_gsm8k_test,
+    "FinCoT": load_fincot_holdout,
 }
 
 # ============================================================
-# EVALUATE ONE MODEL ON ONE BENCHMARK
+# EVALUATION LOOP
 # ============================================================
-def evaluate(model, tokenizer, samples):
+def evaluate(model, tokenizer, samples, bench_name):
     correct = fmt_ok = 0
     latencies = []
     details = []
     skipped = 0
 
-    # leave room for the generated answer within the context window
     max_input_tokens = MAX_SEQ_LENGTH - MAX_NEW_TOKENS - 64
 
-    for s in tqdm(samples, leave=False):
+    for s in tqdm(samples, desc=f"Evaluating {bench_name}", leave=False):
         msgs = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": s["question"].strip()}]
+        
         inputs = tokenizer.apply_chat_template(
             msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         ).to(model.device)
 
-        # --- length guard: skip prompts that don't fit the context window ---
         if inputs.shape[1] > max_input_tokens:
             skipped += 1
             continue
@@ -170,11 +172,22 @@ def evaluate(model, tokenizer, samples):
         full = tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)
         if ANSWER_MARKER in full:
             fmt_ok += 1
+            
         pred = extract_final_answer(full)
-
         nm = numeric_match(pred, s["reference"])
+        
         ok = (nm is True) or (nm is None and text_match(pred, s["reference"]))
         correct += int(ok)
+        
+        # --- DEBUG PRINTS ---
+        if not ok and PRINT_FAILURES:
+            print("\n" + "="*50)
+            print(f"FAILED ON: {bench_name}")
+            print(f"Extracted Answer Text : {pred}")
+            print(f"Extracted Numbers     : {extract_numbers(pred)}")
+            print(f"Reference Numbers     : {extract_numbers(s['reference'])}")
+            print("="*50)
+
         details.append({
             "question": s["question"][:150],
             "reference": s["reference"],
@@ -182,9 +195,10 @@ def evaluate(model, tokenizer, samples):
             "correct": ok,
         })
 
-    n = len(details)  # only count samples actually evaluated
+    n = len(details)
     if skipped:
         print(f"     (skipped {skipped} over-length prompts)")
+        
     return {
         "n": n,
         "skipped": skipped,
@@ -197,31 +211,169 @@ def evaluate(model, tokenizer, samples):
 # ============================================================
 # MODEL LOADER
 # ============================================================
-def load_model(path, base_model_id):
+def load_model(path):
     """
-    Loads base model onto GPU memory, then attaches adapter if required.
-    device_map={"": 0} prevents accelerate from assigning weights to 'meta' tensors.
+    Unsloth handles loading both base models and PEFT adapters cleanly.
+    device_map={"": 0} forces all weights off 'meta' device onto GPU.
     """
-    # 1. Load the base model fully into GPU memory first
     m, tok = FastLanguageModel.from_pretrained(
-        model_name=base_model_id if path != base_model_id else path,
+        model_name=path, 
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=torch.bfloat16, 
         load_in_4bit=False,
-        device_map={"": 0},  # Forces model off 'meta' device to primary GPU
+        device_map={"": 0},
     )
-    
-    # 2. Attach PEFT adapter weights if this isn't the base model
-    if path != base_model_id:
-        m = PeftModel.from_pretrained(m, path)
-        
     FastLanguageModel.for_inference(m)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     return m, tok
 
 # ============================================================
-# RUN EVERYTHING
+# CHART GENERATOR MODULE
+# ============================================================
+def generate_visual_charts(all_results, bench_names, tested_models, output_dir="assets", use_wandb=False):
+    os.makedirs(output_dir, exist_ok=True)
+    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
+    
+    colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B3", "#CCB974"]
+    model_colors = {model: colors[i % len(colors)] for i, model in enumerate(tested_models)}
+    
+    x = np.arange(len(bench_names))
+    width = 0.8 / max(1, len(tested_models))
+    
+    # 1. ACCURACY CHART
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
+    for i, model_key in enumerate(tested_models):
+        accs = [all_results[model_key][b]["accuracy"] for b in bench_names]
+        bars = ax.bar(x + i * width, accs, width, label=model_key, color=model_colors[model_key], edgecolor="black", linewidth=0.6)
+        for b, v in zip(bars, accs):
+            ax.text(b.get_x() + b.get_width() / 2, v + 1.2, f"{v:.1f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+
+    ax.set_xticks(x + width * (len(tested_models) - 1) / 2)
+    ax.set_xticklabels(bench_names, fontsize=10, fontweight="bold")
+    ax.set_ylabel("Accuracy (%)", fontsize=10, fontweight="bold")
+    ax.set_title("Benchmark Accuracy Comparison", fontsize=12, fontweight="bold", pad=12)
+    ax.set_ylim(0, 105)
+    ax.legend(frameon=True, facecolor="white", framealpha=0.9)
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/benchmark_accuracy.png")
+    plt.close()
+
+    # 2. LATENCY CHART
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
+    for i, model_key in enumerate(tested_models):
+        lats = [all_results[model_key][b]["avg_latency_s"] for b in bench_names]
+        bars = ax.bar(x + i * width, lats, width, label=model_key, color=model_colors[model_key], edgecolor="black", linewidth=0.6)
+        for b, v in zip(bars, lats):
+            ax.text(b.get_x() + b.get_width() / 2, v + 0.05, f"{v:.2f}s", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x + width * (len(tested_models) - 1) / 2)
+    ax.set_xticklabels(bench_names, fontsize=10, fontweight="bold")
+    ax.set_ylabel("Avg Latency (seconds / sample)", fontsize=10, fontweight="bold")
+    ax.set_title("Inference Speed by Benchmark", fontsize=12, fontweight="bold", pad=12)
+    ax.legend(frameon=True, facecolor="white", framealpha=0.9)
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/benchmark_latency.png")
+    plt.close()
+
+    # 3. FORMAT COMPLIANCE CHART
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
+    for i, model_key in enumerate(tested_models):
+        fmts = [all_results[model_key][b]["format_compliance"] for b in bench_names]
+        bars = ax.bar(x + i * width, fmts, width, label=model_key, color=model_colors[model_key], edgecolor="black", linewidth=0.6)
+        for b, v in zip(bars, fmts):
+            ax.text(b.get_x() + b.get_width() / 2, v + 1.2, f"{v:.0f}%", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xticks(x + width * (len(tested_models) - 1) / 2)
+    ax.set_xticklabels(bench_names, fontsize=10, fontweight="bold")
+    ax.set_ylabel("Format Compliance (%)", fontsize=10, fontweight="bold")
+    ax.set_title("CoT Formatting Adherence", fontsize=12, fontweight="bold", pad=12)
+    ax.set_ylim(0, 105)
+    ax.legend(frameon=True, facecolor="white", framealpha=0.9)
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/benchmark_format_compliance.png")
+    plt.close()
+
+    # 4. RADAR CHART
+    if len(bench_names) >= 3:
+        angles = np.linspace(0, 2 * np.pi, len(bench_names), endpoint=False).tolist()
+        angles += angles[:1]
+        fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True), dpi=150)
+        for model_key in tested_models:
+            values = [all_results[model_key][b]["accuracy"] for b in bench_names]
+            values += values[:1]
+            ax.plot(angles, values, label=model_key, linewidth=2, color=model_colors[model_key])
+            ax.fill(angles, values, color=model_colors[model_key], alpha=0.15)
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(bench_names, fontsize=10, fontweight="bold")
+        ax.set_ylim(0, 100)
+        ax.set_title("Model Capability Profile", fontsize=12, fontweight="bold", y=1.08)
+        ax.legend(loc="upper right", bbox_to_anchor=(1.2, 1.1), frameon=True)
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/benchmark_radar.png")
+        plt.close()
+
+    # 5. MASTER DASHBOARD (2x2)
+    fig, axs = plt.subplots(2, 2, figsize=(15, 11), dpi=180)
+    for i, model_key in enumerate(tested_models):
+        accs = [all_results[model_key][b]["accuracy"] for b in bench_names]
+        axs[0, 0].bar(x + i * width, accs, width, label=model_key, color=model_colors[model_key])
+    axs[0, 0].set_xticks(x + width * (len(tested_models) - 1) / 2)
+    axs[0, 0].set_xticklabels(bench_names, fontweight="bold")
+    axs[0, 0].set_ylabel("Accuracy (%)")
+    axs[0, 0].set_title("Accuracy by Benchmark", fontweight="bold")
+    axs[0, 0].set_ylim(0, 105)
+    axs[0, 0].legend()
+
+    for i, model_key in enumerate(tested_models):
+        fmts = [all_results[model_key][b]["format_compliance"] for b in bench_names]
+        axs[0, 1].bar(x + i * width, fmts, width, label=model_key, color=model_colors[model_key])
+    axs[0, 1].set_xticks(x + width * (len(tested_models) - 1) / 2)
+    axs[0, 1].set_xticklabels(bench_names, fontweight="bold")
+    axs[0, 1].set_ylabel("Compliance (%)")
+    axs[0, 1].set_title("Format Compliance Rate", fontweight="bold")
+    axs[0, 1].set_ylim(0, 105)
+
+    for i, model_key in enumerate(tested_models):
+        lats = [all_results[model_key][b]["avg_latency_s"] for b in bench_names]
+        axs[1, 0].bar(x + i * width, lats, width, label=model_key, color=model_colors[model_key])
+    axs[1, 0].set_xticks(x + width * (len(tested_models) - 1) / 2)
+    axs[1, 0].set_xticklabels(bench_names, fontweight="bold")
+    axs[1, 0].set_ylabel("Seconds / Sample")
+    axs[1, 0].set_title("Inference Latency", fontweight="bold")
+
+    for model_key in tested_models:
+        avg_acc = np.mean([all_results[model_key][b]["accuracy"] for b in bench_names])
+        avg_lat = np.mean([all_results[model_key][b]["avg_latency_s"] for b in bench_names])
+        axs[1, 1].scatter(avg_lat, avg_acc, s=180, label=model_key, color=model_colors[model_key], edgecolors="black", zorder=4)
+        axs[1, 1].annotate(model_key, (avg_lat, avg_acc), textcoords="offset points", xytext=(8, 5), fontweight="bold")
+    axs[1, 1].set_xlabel("Mean Latency (s/sample)")
+    axs[1, 1].set_ylabel("Mean Accuracy (%)")
+    axs[1, 1].set_title("Overall Efficiency Trade-Off", fontweight="bold")
+    axs[1, 1].set_ylim(0, 105)
+
+    plt.suptitle("Financial Reasoning LLM Benchmark Dashboard", fontsize=16, fontweight="bold", y=0.99)
+    plt.tight_layout()
+    dashboard_path = f"{output_dir}/benchmark_dashboard.png"
+    plt.savefig(dashboard_path)
+    plt.close()
+    
+    print(f"\nAll visual charts & dashboard saved to ./{output_dir}/")
+
+    if use_wandb:
+        wandb.log({
+            "charts/accuracy": wandb.Image(f"{output_dir}/benchmark_accuracy.png"),
+            "charts/latency": wandb.Image(f"{output_dir}/benchmark_latency.png"),
+            "charts/format_compliance": wandb.Image(f"{output_dir}/benchmark_format_compliance.png"),
+            "charts/dashboard": wandb.Image(dashboard_path),
+        })
+        if len(bench_names) >= 3:
+            wandb.log({"charts/radar": wandb.Image(f"{output_dir}/benchmark_radar.png")})
+
+# ============================================================
+# MAIN PIPELINE
 # ============================================================
 def main():
     if USE_WANDB:
@@ -239,40 +391,36 @@ def main():
     for name, s in bench_samples.items():
         print(f"  {name}: {len(s)} samples")
 
-    base_model_id = MODELS_TO_TEST["base"]
     all_results = {}
     
     for model_key, model_path in MODELS_TO_TEST.items():
         print(f"\n{'='*70}\nMODEL: {model_key}  ({model_path})\n{'='*70}")
         try:
-            # Note passing base_model_id here
-            model, tokenizer = load_model(model_path, base_model_id)
+            model, tokenizer = load_model(model_path)
         except Exception as e:
             print(f"  FAILED to load {model_key}: {e}")
             continue
 
         all_results[model_key] = {}
         for bench_name, samples in bench_samples.items():
-            print(f"  -> {bench_name}")
-            res = evaluate(model, tokenizer, samples)
+            res = evaluate(model, tokenizer, samples, bench_name)
             all_results[model_key][bench_name] = res
-            print(f"     accuracy={res['accuracy']:.1f}%  "
+            
+            print(f"     -> {bench_name}: accuracy={res['accuracy']:.1f}%  "
                   f"format={res['format_compliance']:.1f}%  "
-                  f"latency={res['avg_latency_s']:.2f}s  "
-                  f"(n={res['n']}, skipped={res['skipped']})")
+                  f"latency={res['avg_latency_s']:.2f}s")
+
             if USE_WANDB:
                 wandb.log({
                     f"{model_key}/{bench_name}/accuracy": res["accuracy"],
                     f"{model_key}/{bench_name}/format_compliance": res["format_compliance"],
                     f"{model_key}/{bench_name}/latency_s": res["avg_latency_s"],
-                    f"{model_key}/{bench_name}/n_evaluated": res["n"],
-                    f"{model_key}/{bench_name}/skipped": res["skipped"],
                 })
 
         del model, tokenizer
         torch.cuda.empty_cache()
 
-    # ---------- console report ----------
+    # ---------- FINAL REPORT & EXPORTS ----------
     print("\n\n" + "=" * 78)
     print("BENCHMARK SUMMARY  (accuracy %)")
     print("=" * 78)
@@ -285,83 +433,20 @@ def main():
             row += f"{all_results[model_key][bench_name]['accuracy']:>15.1f}%"
         print(row)
 
-    print("\nFORMAT COMPLIANCE (%)  [only meaningful for models using our markers]")
-    for bench_name in bench_samples:
-        row = f"{bench_name:<14}"
-        for model_key in tested:
-            row += f"{all_results[model_key][bench_name]['format_compliance']:>15.1f}%"
-        print(row)
-
-    print("\nAVG LATENCY (s/sample)")
-    for bench_name in bench_samples:
-        row = f"{bench_name:<14}"
-        for model_key in tested:
-            row += f"{all_results[model_key][bench_name]['avg_latency_s']:>15.2f}s"
-        print(row)
-
-    print("\nSAMPLES EVALUATED / SKIPPED")
-    for bench_name in bench_samples:
-        row = f"{bench_name:<14}"
-        for model_key in tested:
-            r = all_results[model_key][bench_name]
-            row += f"{r['n']:>10}/{r['skipped']:<4}"
-        print(row)
-
-    # ---------- save JSON ----------
     with open("benchmark_report.json", "w") as f:
         json.dump(all_results, f, indent=2)
-    print("\nFull details saved to benchmark_report.json")
 
-    # ---------- bar chart ----------
-    os.makedirs("assets", exist_ok=True)
-    bench_names = list(bench_samples.keys())
-    x = range(len(bench_names))
-    width = 0.8 / max(1, len(tested))
-
-    plt.figure(figsize=(10, 6))
-    for i, model_key in enumerate(tested):
-        vals = [all_results[model_key][b]["accuracy"] for b in bench_names]
-        offsets = [xi + i * width for xi in x]
-        bars = plt.bar(offsets, vals, width, label=model_key)
-        for b, v in zip(bars, vals):
-            plt.text(b.get_x() + b.get_width() / 2, v + 1, f"{v:.0f}",
-                     ha="center", va="bottom", fontsize=8)
-
-    plt.xticks([xi + width * (len(tested) - 1) / 2 for xi in x], bench_names)
-    plt.ylabel("Accuracy (%)")
-    plt.title("Model Comparison — Accuracy by Benchmark")
-    plt.ylim(0, 100)
-    plt.legend()
-    plt.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    chart_path = "assets/benchmark_comparison.png"
-    plt.savefig(chart_path, dpi=150)
-    print(f"Saved chart to {chart_path}")
+    # Generate multi-panel charts
+    generate_visual_charts(
+        all_results=all_results,
+        bench_names=list(bench_samples.keys()),
+        tested_models=tested,
+        output_dir="assets",
+        use_wandb=USE_WANDB,
+    )
 
     if USE_WANDB:
-        wandb.log({"benchmark_chart": wandb.Image(chart_path)})
-        # also log a summary table
-        table = wandb.Table(columns=["model"] + bench_names)
-        for model_key in tested:
-            table.add_data(model_key,
-                           *[all_results[model_key][b]["accuracy"] for b in bench_names])
-        wandb.log({"benchmark_summary": table})
         wandb.finish()
-
-    # ---------- markdown snippet for the model card ----------
-    print("\n" + "=" * 78)
-    print("MODEL CARD SNIPPET (paste into README.md):")
-    print("=" * 78)
-    md = ["## Benchmark\n",
-          "Evaluated on held-out test sets (greedy decoding, ±1% numeric tolerance).\n",
-          "| Benchmark | " + " | ".join(tested) + " |",
-          "|" + "---|" * (len(tested) + 1)]
-    for bench_name in bench_names:
-        cells = [f"{all_results[m][bench_name]['accuracy']:.1f}%" for m in tested]
-        md.append(f"| {bench_name} | " + " | ".join(cells) + " |")
-    md.append("\n![Benchmark comparison](assets/benchmark_comparison.png)")
-    print("\n".join(md))
-
 
 if __name__ == "__main__":
     main()
