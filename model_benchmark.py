@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from unsloth import FastLanguageModel
 from datasets import load_dataset
+from peft import PeftModel  # Added import for PEFT adapter handling
 
 # ============================================================
 # CONFIG
@@ -196,11 +197,24 @@ def evaluate(model, tokenizer, samples):
 # ============================================================
 # MODEL LOADER
 # ============================================================
-def load_model(path):
+def load_model(path, base_model_id):
+    """
+    Loads base model onto GPU memory, then attaches adapter if required.
+    device_map={"": 0} prevents accelerate from assigning weights to 'meta' tensors.
+    """
+    # 1. Load the base model fully into GPU memory first
     m, tok = FastLanguageModel.from_pretrained(
-        model_name=path, max_seq_length=MAX_SEQ_LENGTH,
-        dtype=torch.bfloat16, load_in_4bit=False,
+        model_name=base_model_id if path != base_model_id else path,
+        max_seq_length=MAX_SEQ_LENGTH,
+        dtype=torch.bfloat16, 
+        load_in_4bit=False,
+        device_map={"": 0},  # Forces model off 'meta' device to primary GPU
     )
+    
+    # 2. Attach PEFT adapter weights if this isn't the base model
+    if path != base_model_id:
+        m = PeftModel.from_pretrained(m, path)
+        
     FastLanguageModel.for_inference(m)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -225,11 +239,14 @@ def main():
     for name, s in bench_samples.items():
         print(f"  {name}: {len(s)} samples")
 
+    base_model_id = MODELS_TO_TEST["base"]
     all_results = {}
+    
     for model_key, model_path in MODELS_TO_TEST.items():
         print(f"\n{'='*70}\nMODEL: {model_key}  ({model_path})\n{'='*70}")
         try:
-            model, tokenizer = load_model(model_path)
+            # Note passing base_model_id here
+            model, tokenizer = load_model(model_path, base_model_id)
         except Exception as e:
             print(f"  FAILED to load {model_key}: {e}")
             continue
