@@ -28,7 +28,7 @@ MODELS_TO_TEST = {
 N_PER_BENCHMARK = 150          # samples per dataset; raise for tighter estimates
 MAX_NEW_TOKENS  = 640
 NUM_TOLERANCE   = 0.01         # 1% relative tolerance for numeric match
-MAX_SEQ_LENGTH  = 4096
+MAX_SEQ_LENGTH  = 8192         # raised from 4096 to fit larger FinQA contexts
 
 # Weights & Biases
 WANDB_ENTITY  = "aditya_1976-shri-ramdeobaba-college-of-engineering-and-m"
@@ -142,6 +142,11 @@ def evaluate(model, tokenizer, samples):
     correct = fmt_ok = 0
     latencies = []
     details = []
+    skipped = 0
+
+    # leave room for the generated answer within the context window
+    max_input_tokens = MAX_SEQ_LENGTH - MAX_NEW_TOKENS - 64
+
     for s in tqdm(samples, leave=False):
         msgs = [{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": s["question"].strip()}]
@@ -149,11 +154,16 @@ def evaluate(model, tokenizer, samples):
             msgs, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         ).to(model.device)
 
+        # --- length guard: skip prompts that don't fit the context window ---
+        if inputs.shape[1] > max_input_tokens:
+            skipped += 1
+            continue
+
         t0 = time.time()
         with torch.no_grad():
             out = model.generate(
                 input_ids=inputs, max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False, use_cache=True,
+                max_length=None, do_sample=False, use_cache=True,
                 pad_token_id=tokenizer.pad_token_id,
             )
         latencies.append(time.time() - t0)
@@ -173,9 +183,12 @@ def evaluate(model, tokenizer, samples):
             "correct": ok,
         })
 
-    n = len(samples)
+    n = len(details)  # only count samples actually evaluated
+    if skipped:
+        print(f"     (skipped {skipped} over-length prompts)")
     return {
         "n": n,
+        "skipped": skipped,
         "accuracy": correct / n * 100 if n else 0.0,
         "format_compliance": fmt_ok / n * 100 if n else 0.0,
         "avg_latency_s": sum(latencies) / n if n else 0.0,
@@ -205,6 +218,7 @@ def main():
             name="benchmark-comparison",
             config={"n_per_benchmark": N_PER_BENCHMARK,
                     "num_tolerance": NUM_TOLERANCE,
+                    "max_seq_length": MAX_SEQ_LENGTH,
                     "models": list(MODELS_TO_TEST.keys())},
         )
 
@@ -229,12 +243,15 @@ def main():
             all_results[model_key][bench_name] = res
             print(f"     accuracy={res['accuracy']:.1f}%  "
                   f"format={res['format_compliance']:.1f}%  "
-                  f"latency={res['avg_latency_s']:.2f}s")
+                  f"latency={res['avg_latency_s']:.2f}s  "
+                  f"(n={res['n']}, skipped={res['skipped']})")
             if USE_WANDB:
                 wandb.log({
                     f"{model_key}/{bench_name}/accuracy": res["accuracy"],
                     f"{model_key}/{bench_name}/format_compliance": res["format_compliance"],
                     f"{model_key}/{bench_name}/latency_s": res["avg_latency_s"],
+                    f"{model_key}/{bench_name}/n_evaluated": res["n"],
+                    f"{model_key}/{bench_name}/skipped": res["skipped"],
                 })
 
         del model, tokenizer
@@ -265,6 +282,14 @@ def main():
         row = f"{bench_name:<14}"
         for model_key in tested:
             row += f"{all_results[model_key][bench_name]['avg_latency_s']:>15.2f}s"
+        print(row)
+
+    print("\nSAMPLES EVALUATED / SKIPPED")
+    for bench_name in bench_samples:
+        row = f"{bench_name:<14}"
+        for model_key in tested:
+            r = all_results[model_key][bench_name]
+            row += f"{r['n']:>10}/{r['skipped']:<4}"
         print(row)
 
     # ---------- save JSON ----------
