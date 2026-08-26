@@ -14,7 +14,7 @@ import wandb
 MODELS_TO_TEST = {
     "base":       "unsloth/Meta-Llama-3.1-8B-Instruct",
     "my_fincot":  "Aditya757864/llama3.1-8b-fincot",
-    "fino1_ref":  "TheFinAI/Fino1-8B",
+    #"fino1_ref":  "TheFinAI/Fino1-8B",
 }
 N_PER_BENCHMARK = 100
 
